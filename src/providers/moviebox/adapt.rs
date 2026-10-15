@@ -561,6 +561,41 @@ pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
     }
 }
 
+pub fn moviebox_resource_position_json_to_release(
+    payload: &serde_json::Value,
+    original: &Release,
+    user_agent: &str,
+) -> Option<Release> {
+    let resource_id = original.resource_id.as_deref()?;
+    let data = payload.get("data").unwrap_or(payload);
+    let items = data.get("list")?.as_array()?;
+
+    for item in items {
+        let candidate = moviebox_resource_item_to_release(item);
+        if candidate.resource_id.as_deref() != Some(resource_id)
+            || candidate.season != original.season
+            || candidate.episode != original.episode
+        {
+            continue;
+        }
+        let url = candidate.direct_url()?;
+        let parsed = reqwest::Url::parse(url).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            continue;
+        }
+
+        let mut release = original.clone();
+        release.mirrors = candidate.mirrors;
+        for mirror in &mut release.mirrors {
+            mirror.direct_file = true;
+            mirror.headers = vec![("User-Agent".to_string(), user_agent.to_string())];
+        }
+        return Some(release);
+    }
+
+    None
+}
+
 pub fn is_deprecation_notice_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains("1c7de0bd3393702d9191801f15f88f8d")
@@ -1370,5 +1405,102 @@ mod tests {
         let releases = moviebox_resource_json_to_releases(&payload);
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].filename, "Valid Stream");
+    }
+
+    #[test]
+    fn test_resource_position_recovers_file_and_preserves_release_metadata() {
+        let notice_item = json!({
+            "id": "8351979522423502496",
+            "source": "Movie",
+            "resolution": 1080,
+            "codec": "H264",
+            "size": "1957630262",
+            "se": 0,
+            "ep": 0,
+            "resourceLink": "https://macdn.aoneroom.com/other/2026/09/04/b164fbfb4347792950bdfbfb563d39d9.mp4"
+        });
+        let original = moviebox_resource_item_to_release(&notice_item);
+        assert!(original.mirrors.is_empty());
+
+        let payload = json!({
+            "data": {
+                "list": [
+                    {
+                        "id": "8351979522423502496",
+                        "source": "Movie",
+                        "resolution": 0,
+                        "size": 0,
+                        "se": 0,
+                        "ep": 0,
+                        "resourceLink": "https://bcdnw.hakunaymatata.com/resource/ea8fd5585f9982c0fc9cd6f7438b5d2b.mp4?sign=abc&t=1776053759"
+                    }
+                ]
+            }
+        });
+
+        let recovered =
+            moviebox_resource_position_json_to_release(&payload, &original, "MovieBoxTest/1.0")
+                .expect("resource-position should recover blocked resource");
+
+        assert_eq!(recovered.filename, "Movie 1080p");
+        assert_eq!(recovered.quality.as_deref(), Some("1080p"));
+        assert_eq!(recovered.codec.as_deref(), Some("H264"));
+        assert_eq!(recovered.size_bytes, Some(1_957_630_262));
+        assert_eq!(
+            recovered.resource_id.as_deref(),
+            Some("8351979522423502496")
+        );
+        assert_eq!(recovered.mirrors.len(), 1);
+        assert!(recovered.mirrors[0].direct_file);
+        assert_eq!(
+            recovered.mirrors[0].resolver_url,
+            "https://bcdnw.hakunaymatata.com/resource/ea8fd5585f9982c0fc9cd6f7438b5d2b.mp4?sign=abc&t=1776053759"
+        );
+        assert_eq!(
+            recovered.mirrors[0].headers,
+            vec![("User-Agent".to_string(), "MovieBoxTest/1.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_resource_position_rejects_notices_wrong_resources_and_wrong_episodes() {
+        let original = moviebox_resource_item_to_release(&json!({
+            "id": "200",
+            "source": "Show",
+            "resolution": 720,
+            "se": 1,
+            "ep": 2,
+            "resourceLink": "https://macdn.aoneroom.com/other/2026/09/04/b164fbfb4347792950bdfbfb563d39d9.mp4"
+        }));
+
+        let payload = json!({
+            "data": {
+                "list": [
+                    {
+                        "id": "999",
+                        "se": 1,
+                        "ep": 2,
+                        "resourceLink": "https://bcdnw.hakunaymatata.com/resource/wrong-id.mp4?sign=abc&t=1"
+                    },
+                    {
+                        "id": "200",
+                        "se": 1,
+                        "ep": 3,
+                        "resourceLink": "https://bcdnw.hakunaymatata.com/resource/wrong-ep.mp4?sign=abc&t=1"
+                    },
+                    {
+                        "id": "200",
+                        "se": 1,
+                        "ep": 2,
+                        "resourceLink": "https://macdn.aoneroom.com/other/2026/09/04/b164fbfb4347792950bdfbfb563d39d9.mp4"
+                    }
+                ]
+            }
+        });
+
+        assert!(
+            moviebox_resource_position_json_to_release(&payload, &original, "MovieBoxTest/1.0")
+                .is_none()
+        );
     }
 }

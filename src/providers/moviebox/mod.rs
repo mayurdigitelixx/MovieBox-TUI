@@ -62,20 +62,15 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
         season: usize,
         episode: usize,
     ) -> Result<Vec<crate::providers::models::Release>, ProviderError> {
+        let page = if episode > 0 {
+            (episode - 1) / 20 + 1
+        } else {
+            1
+        };
+        let resource_path = episode_resource_path(id, season, episode);
         let (play_info_res, resources_res) = tokio::join!(
             self.get_play_info(id, season, episode),
-            self.get_resources(
-                id,
-                season,
-                episode,
-                if episode > 0 {
-                    (episode - 1) / 20 + 1
-                } else {
-                    1
-                },
-                None,
-                20,
-            )
+            self.get(&resource_path)
         );
 
         let mut releases = Vec::new();
@@ -98,22 +93,55 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
             }
         }
 
-        if let Ok(res_json) = resources_res {
-            for rel in adapt::moviebox_resource_json_to_releases(&res_json) {
-                if let Some(url) = rel.direct_url() {
-                    let base = url.split('?').next().unwrap_or(url).to_string();
-                    if !base.is_empty() && seen_urls.contains(&base) {
-                        continue;
-                    }
-                    seen_urls.insert(base);
-                }
-                if (season == 0 && episode == 0)
-                    || (rel.season == Some(season) && rel.episode == Some(episode))
-                    || (rel.season.is_none() && rel.episode.is_none())
+        let items = match resources_res {
+            Ok(res_json) => res_json
+                .get("list")
+                .and_then(|l| l.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            Err(_) if releases.is_empty() => {
+                self.fetch_resource_page(id, season, episode, 0, page)
+                    .await
+                    .map_err(ProviderError::from)?
+                    .0
+            }
+            Err(_) => Vec::new(),
+        };
+
+        for item in items {
+            let mut rel = adapt::moviebox_resource_item_to_release(&item);
+            if (season != 0 || episode != 0)
+                && (rel.season != Some(season) || rel.episode != Some(episode))
+            {
+                continue;
+            }
+
+            if rel.mirrors.is_empty() {
+                let origin = item
+                    .get("resourceLink")
+                    .or_else(|| item.get("url"))
+                    .and_then(|v| v.as_str())
+                    .filter(|url| adapt::is_deprecation_notice_url(url));
+                if let (Some(origin), Some(resource_id)) = (origin, rel.resource_id.as_deref())
+                    && let Ok(payload) = self.get_resource_position(id, resource_id, origin).await
+                    && let Some(recovered) = adapt::moviebox_resource_position_json_to_release(
+                        &payload,
+                        &rel,
+                        self.user_agent(),
+                    )
                 {
-                    releases.push(rel);
+                    rel = recovered;
                 }
             }
+
+            let Some(url) = rel.direct_url() else {
+                continue;
+            };
+            let base = url.split('?').next().unwrap_or(url).to_string();
+            if !base.is_empty() && !seen_urls.insert(base) {
+                continue;
+            }
+            releases.push(rel);
         }
 
         if releases.is_empty() {
@@ -316,6 +344,39 @@ impl MovieBoxClient {
         );
         self.get(&path).await
     }
+
+    pub async fn get_resource_position(
+        &self,
+        subject_id: &str,
+        resource_id: &str,
+        fail_url: &str,
+    ) -> Result<Value, ScraperError> {
+        let path = resource_position_path(subject_id, resource_id, fail_url);
+        self.get(&path).await
+    }
+}
+
+pub fn episode_resource_path(subject_id: &str, season: usize, episode: usize) -> String {
+    format!(
+        "/wefeed-mobile-bff/subject-api/resource/v2?subjectId={subject_id}&page=1&perPage=20&all=0&startPosition=1&endPosition=1&pagerMode=2&resolution=0&se={season}&epFrom={episode}&epTo={episode}&isVip=true"
+    )
+}
+
+pub fn resource_position_path(subject_id: &str, resource_id: &str, fail_url: &str) -> String {
+    let mut url =
+        reqwest::Url::parse("https://moviebox.local/wefeed-mobile-bff/subject-api/resource-position/v2")
+            .expect("static moviebox resource-position URL is valid");
+    url.query_pairs_mut()
+        .append_pair("subjectId", subject_id)
+        .append_pair("resourceId", resource_id)
+        .append_pair("failUrl", fail_url)
+        .append_pair("failCode", "404")
+        .append_pair("resourceNum", "0")
+        .append_pair("isVip", "true");
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
 }
 
 pub fn resource_page_path(
@@ -372,6 +433,28 @@ mod tests {
         assert_eq!(
             path,
             "/wefeed-mobile-bff/subject-api/resource?subjectId=67890&se=1&ep=10&page=2&perPage=20&resolution=1080"
+        );
+    }
+
+    #[test]
+    fn test_episode_resource_path_targets_exact_episode() {
+        let path = episode_resource_path("1382465867459478920", 3, 7);
+        assert_eq!(
+            path,
+            "/wefeed-mobile-bff/subject-api/resource/v2?subjectId=1382465867459478920&page=1&perPage=20&all=0&startPosition=1&endPosition=1&pagerMode=2&resolution=0&se=3&epFrom=7&epTo=7&isVip=true"
+        );
+    }
+
+    #[test]
+    fn test_resource_position_path_encodes_failed_url() {
+        let path = resource_position_path(
+            "3815343854912427320",
+            "8351979522423502496",
+            "https://macdn.aoneroom.com/other/2026/09/04/b164fbfb4347792950bdfbfb563d39d9.mp4",
+        );
+        assert_eq!(
+            path,
+            "/wefeed-mobile-bff/subject-api/resource-position/v2?subjectId=3815343854912427320&resourceId=8351979522423502496&failUrl=https%3A%2F%2Fmacdn.aoneroom.com%2Fother%2F2026%2F09%2F04%2Fb164fbfb4347792950bdfbfb563d39d9.mp4&failCode=404&resourceNum=0&isVip=true"
         );
     }
 }

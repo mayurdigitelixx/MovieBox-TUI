@@ -329,8 +329,15 @@ pub fn probe_android_openers() -> Vec<AndroidOpener> {
 static ANDROID_OPENERS: std::sync::LazyLock<Vec<AndroidOpener>> =
     std::sync::LazyLock::new(probe_android_openers);
 
-pub fn android_openers() -> &'static [AndroidOpener] {
-    ANDROID_OPENERS.as_slice()
+pub fn android_openers() -> std::borrow::Cow<'static, [AndroidOpener]> {
+    #[cfg(test)]
+    {
+        std::borrow::Cow::Owned(probe_android_openers())
+    }
+    #[cfg(not(test))]
+    {
+        std::borrow::Cow::Borrowed(ANDROID_OPENERS.as_slice())
+    }
 }
 
 fn append_android_intent_extras(
@@ -714,7 +721,6 @@ fn vlc_command(
             .arg(format!("--width={width}"))
             .arg(format!("--height={height}"));
     }
-    command.arg("--play-and-exit");
     #[cfg(not(target_os = "macos"))]
     command.arg("--no-one-instance");
     command.arg("--network-caching=3000");
@@ -1186,6 +1192,9 @@ fn probe_mpv() -> Option<String> {
 
     #[cfg(target_os = "android")]
     {
+        candidates.push("/usr/bin/mpv".to_string());
+        candidates.push("/usr/local/bin/mpv".to_string());
+        candidates.push("/bin/mpv".to_string());
         if let Ok(prefix) = std::env::var("PREFIX") {
             candidates.push(format!("{prefix}/bin/mpv"));
         }
@@ -1279,6 +1288,9 @@ fn probe_vlc() -> Option<String> {
 
     #[cfg(target_os = "android")]
     {
+        candidates.push("/usr/bin/vlc".to_string());
+        candidates.push("/usr/local/bin/vlc".to_string());
+        candidates.push("/bin/vlc".to_string());
         if let Ok(prefix) = std::env::var("PREFIX") {
             candidates.push(format!("{prefix}/bin/vlc"));
         }
@@ -1616,7 +1628,6 @@ mod tests {
 
         assert!(args.contains(&"--width=1280".into()));
         assert!(args.contains(&"--height=720".into()));
-        assert!(args.contains(&"--play-and-exit".into()));
         assert!(args.contains(&"--start-time=42".into()));
         assert!(args.contains(&"--http-referrer=https://example.test/".into()));
         assert!(args.contains(&"--http-user-agent=MovieBox-Test".into()));
@@ -1792,13 +1803,17 @@ mod tests {
 
     #[test]
     fn test_detect_prioritizes_android_intent_on_termux() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!("termux_test_{}", std::process::id()));
         let bin_dir = temp_dir.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let termux_am = bin_dir.join("termux-am");
         std::fs::write(&termux_am, "#!/bin/sh\nexit 0").unwrap();
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let orig_display = std::env::var("DISPLAY").ok();
+        let orig_wayland = std::env::var("WAYLAND_DISPLAY").ok();
         unsafe {
+            std::env::remove_var("DISPLAY");
+            std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("TERMUX_VERSION", "0.118.0");
             std::env::set_var("PREFIX", temp_dir.to_str().unwrap());
         }
@@ -1806,6 +1821,16 @@ mod tests {
         unsafe {
             std::env::remove_var("TERMUX_VERSION");
             std::env::remove_var("PREFIX");
+            if let Some(val) = orig_display {
+                std::env::set_var("DISPLAY", val);
+            } else {
+                std::env::remove_var("DISPLAY");
+            }
+            if let Some(val) = orig_wayland {
+                std::env::set_var("WAYLAND_DISPLAY", val);
+            } else {
+                std::env::remove_var("WAYLAND_DISPLAY");
+            }
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
 
