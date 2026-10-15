@@ -1,11 +1,14 @@
 use moviebox_tui::providers::ReleaseProvider;
+use moviebox_tui::providers::models::ResolutionIntent;
 use moviebox_tui::providers::moviebox::client::MovieBoxClient;
+use moviebox_tui::service::MovieBoxService;
 
 #[tokio::test]
 #[ignore = "live network test; run with cargo test --test live_stream_verification -- --ignored"]
 async fn test_live_movie_stream_real_urls() {
     let client = MovieBoxClient::new();
     client.init().await.expect("client init successful");
+    let service = MovieBoxService::new();
 
     let releases = client
         .episode_streams("4179386086617137184", 0, 0)
@@ -25,8 +28,14 @@ async fn test_live_movie_stream_real_urls() {
                 link
             );
             assert!(
-                link.contains("hakunaymatata.com") && link.ends_with("/index.mpd"),
-                "Stream URL should be a valid MPEG-DASH manifest: {}",
+                !moviebox_tui::providers::moviebox::adapt::is_deprecation_notice_url(link),
+                "Stream URL should NOT be a deprecation notice video: {}",
+                link
+            );
+            assert!(
+                link.contains("hakunaymatata.com")
+                    && (link.ends_with("/index.mpd") || link.contains("/resource/")),
+                "Stream URL should be a valid MovieBox stream: {}",
                 link
             );
             real_streams_found += 1;
@@ -37,6 +46,12 @@ async fn test_live_movie_stream_real_urls() {
         real_streams_found > 0,
         "Should find at least one real movie stream"
     );
+
+    let playback = service
+        .resolve_playback_source(&releases[0], None, ResolutionIntent::Playback)
+        .await
+        .expect("resolve movie playback source");
+    probe_media_stream(&playback.url, &playback.headers, "MovieBox movie").await;
 }
 
 #[tokio::test]
@@ -44,6 +59,7 @@ async fn test_live_movie_stream_real_urls() {
 async fn test_live_series_resolutions_and_streams() {
     let client = MovieBoxClient::new();
     client.init().await.expect("client init successful");
+    let service = MovieBoxService::new();
 
     let search_res = client
         .search("Breaking Bad", 1)
@@ -70,7 +86,8 @@ async fn test_live_series_resolutions_and_streams() {
     assert!(!releases_ep1.is_empty(), "should find episode 1 streams");
     let ep1_url = releases_ep1[0].direct_url().expect("valid direct url");
     println!("Resolved S01E01 direct URL: {}", ep1_url);
-    assert!(ep1_url.contains("_1_1_"));
+    assert_eq!(releases_ep1[0].season, Some(1));
+    assert_eq!(releases_ep1[0].episode, Some(1));
 
     let releases_ep2 = client
         .episode_streams(&series.id.value, 1, 2)
@@ -79,11 +96,18 @@ async fn test_live_series_resolutions_and_streams() {
     assert!(!releases_ep2.is_empty(), "should find episode 2 streams");
     let ep2_url = releases_ep2[0].direct_url().expect("valid direct url");
     println!("Resolved S01E02 direct URL: {}", ep2_url);
-    assert!(ep2_url.contains("_1_2_"));
+    assert_eq!(releases_ep2[0].season, Some(1));
+    assert_eq!(releases_ep2[0].episode, Some(2));
     assert_ne!(
         ep1_url, ep2_url,
         "different episodes must have different manifests"
     );
+
+    let playback = service
+        .resolve_playback_source(&releases_ep1[0], None, ResolutionIntent::Playback)
+        .await
+        .expect("resolve series playback source");
+    probe_media_stream(&playback.url, &playback.headers, "MovieBox series S01E01").await;
 }
 
 #[tokio::test]
@@ -127,11 +151,10 @@ async fn test_live_multiple_seasons_and_episodes_return_distinct_streams() {
                 "{} S{:02}E{:02} -> filename: {}, url: {}",
                 series_title, season, episode, releases[0].filename, url
             );
-            assert!(
-                releases[0]
-                    .filename
-                    .contains(&format!("S{:02}E{:02}", season, episode)),
-                "filename must match season and episode"
+            assert_eq!(
+                (releases[0].season, releases[0].episode),
+                (Some(season), Some(episode)),
+                "release metadata must match season and episode"
             );
             urls.push(((season, episode), url));
         }

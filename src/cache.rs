@@ -228,10 +228,10 @@ pub fn get_provider_stream_path(
     episode: usize,
 ) -> PathBuf {
     let mut path = get_provider_cache_dir(provider, "streams");
-    let schema = if provider == ProviderKind::FourKHdHub {
-        "v4_"
-    } else {
-        ""
+    let schema = match provider {
+        ProviderKind::FourKHdHub => "v4_",
+        ProviderKind::MovieBox => "v2_",
+        _ => "",
     };
     let hashed_id = md5_hex(subject_id);
     path.push(format!("{schema}{hashed_id}_{season}_{episode}.cache"));
