@@ -59,11 +59,15 @@ pub fn has_graphical_display() -> bool {
 }
 
 pub fn detect() -> Vec<PlayerKind> {
+    detect_with_openers(android_openers())
+}
+
+fn detect_with_openers(openers: &[AndroidOpener]) -> Vec<PlayerKind> {
     let mut players = Vec::new();
 
     let is_termux = crate::config::is_termux_environment();
     let has_gui = has_graphical_display();
-    if is_termux && !has_gui && !android_openers().is_empty() {
+    if is_termux && !has_gui && !openers.is_empty() {
         players.push(PlayerKind::AndroidIntent);
     }
 
@@ -80,7 +84,7 @@ pub fn detect() -> Vec<PlayerKind> {
         players.push(PlayerKind::Vlc);
     }
 
-    if (!is_termux || has_gui) && !android_openers().is_empty() {
+    if (!is_termux || has_gui) && !openers.is_empty() {
         players.push(PlayerKind::AndroidIntent);
     }
 
@@ -417,7 +421,15 @@ pub fn android_intent_commands(
     subtitle: Option<&str>,
     headers: &[(String, String)],
 ) -> Vec<(AndroidOpener, Command)> {
-    let openers = android_openers();
+    android_intent_commands_with_openers(url, subtitle, headers, android_openers())
+}
+
+fn android_intent_commands_with_openers(
+    url: &str,
+    subtitle: Option<&str>,
+    headers: &[(String, String)],
+    openers: &[AndroidOpener],
+) -> Vec<(AndroidOpener, Command)> {
     if openers.is_empty() {
         let mut cmd = Command::new("termux-open");
         cmd.arg("--chooser")
@@ -1669,6 +1681,7 @@ mod tests {
     }
     #[test]
     fn mpv_command_passes_multiple_header_fields_individually() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let headers = vec![
             ("Cookie".to_string(), "session=abc, token=123".to_string()),
             ("Accept".to_string(), "text/html, */*".to_string()),
@@ -1709,14 +1722,37 @@ mod tests {
         std::fs::write(&termux_am, "#!/bin/sh\nexit 0").unwrap();
         std::fs::write(&termux_open, "#!/bin/sh\nexit 0").unwrap();
 
+        let original_path = std::env::var_os("PATH");
+        let original_prefix = std::env::var_os("PREFIX");
+        let original_termux = std::env::var_os("TERMUX_VERSION");
         unsafe {
             std::env::set_var("TERMUX_VERSION", "0.118.0");
             std::env::set_var("PREFIX", temp_dir.to_str().unwrap());
+            std::env::set_var("PATH", &bin_dir);
         }
-        let commands = android_intent_commands("https://example.test/stream.m3u8", None, &[]);
+        let openers = probe_android_openers();
+        let commands = android_intent_commands_with_openers(
+            "https://example.test/stream.m3u8",
+            None,
+            &[],
+            &openers,
+        );
         unsafe {
-            std::env::remove_var("TERMUX_VERSION");
-            std::env::remove_var("PREFIX");
+            if let Some(value) = original_termux {
+                std::env::set_var("TERMUX_VERSION", value);
+            } else {
+                std::env::remove_var("TERMUX_VERSION");
+            }
+            if let Some(value) = original_prefix {
+                std::env::set_var("PREFIX", value);
+            } else {
+                std::env::remove_var("PREFIX");
+            }
+            if let Some(value) = original_path {
+                std::env::set_var("PATH", value);
+            } else {
+                std::env::remove_var("PATH");
+            }
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
 
@@ -1757,6 +1793,7 @@ mod tests {
     }
     #[test]
     fn test_mpv_command_headers_no_broken_ytdl_raw_options() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
         let headers = vec![
             ("User-Agent".into(), ua.into()),
@@ -1798,14 +1835,47 @@ mod tests {
         let termux_am = bin_dir.join("termux-am");
         std::fs::write(&termux_am, "#!/bin/sh\nexit 0").unwrap();
         let _lock = ENV_MUTEX.lock().unwrap();
+        let original_path = std::env::var_os("PATH");
+        let original_prefix = std::env::var_os("PREFIX");
+        let original_termux = std::env::var_os("TERMUX_VERSION");
+        let original_display = std::env::var_os("DISPLAY");
+        let original_wayland = std::env::var_os("WAYLAND_DISPLAY");
         unsafe {
             std::env::set_var("TERMUX_VERSION", "0.118.0");
             std::env::set_var("PREFIX", temp_dir.to_str().unwrap());
+            std::env::set_var("PATH", &bin_dir);
+            std::env::remove_var("DISPLAY");
+            std::env::remove_var("WAYLAND_DISPLAY");
         }
-        let detected = detect();
+        let detected = detect_with_openers(&[AndroidOpener::TermuxAm(
+            termux_am.to_string_lossy().into_owned(),
+        )]);
         unsafe {
-            std::env::remove_var("TERMUX_VERSION");
-            std::env::remove_var("PREFIX");
+            if let Some(value) = original_termux {
+                std::env::set_var("TERMUX_VERSION", value);
+            } else {
+                std::env::remove_var("TERMUX_VERSION");
+            }
+            if let Some(value) = original_prefix {
+                std::env::set_var("PREFIX", value);
+            } else {
+                std::env::remove_var("PREFIX");
+            }
+            if let Some(value) = original_path {
+                std::env::set_var("PATH", value);
+            } else {
+                std::env::remove_var("PATH");
+            }
+            if let Some(value) = original_display {
+                std::env::set_var("DISPLAY", value);
+            } else {
+                std::env::remove_var("DISPLAY");
+            }
+            if let Some(value) = original_wayland {
+                std::env::set_var("WAYLAND_DISPLAY", value);
+            } else {
+                std::env::remove_var("WAYLAND_DISPLAY");
+            }
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
 
@@ -1926,6 +1996,7 @@ mod tests {
 
     #[test]
     fn test_mpv_command_headers_and_arguments_assembly() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let headers = vec![
             ("User-Agent".to_string(), "MovieBox-Tui/0.1.23".to_string()),
             ("Referer".to_string(), "https://upstream.cdn/".to_string()),
@@ -2057,7 +2128,21 @@ mod tests {
         super::configure_detached_process(&mut cmd);
         let mut child = cmd.spawn().expect("spawn detached sh");
         let pid = child.id() as libc::pid_t;
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        // Wait until the child really left the parent's session and ignored
+        // SIGHUP. Signalling it earlier races the `pre_exec` hook and would
+        // kill the child with the inherited default disposition.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::getsid(pid) } == pid {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            unsafe { libc::getsid(pid) },
+            pid,
+            "the detached child never created its own session"
+        );
         unsafe {
             libc::kill(pid, libc::SIGHUP);
             libc::kill(-pid, libc::SIGHUP);

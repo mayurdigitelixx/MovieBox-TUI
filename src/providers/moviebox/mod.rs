@@ -62,6 +62,23 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
         season: usize,
         episode: usize,
     ) -> Result<Vec<crate::providers::models::Release>, ProviderError> {
+        // The details payload still carries the real media links in
+        // `resourceDetectors[].resolutionList[]`, while `play-info` only
+        // returns the site trailer. Prefer the detector links and keep the
+        // play-info/resources path as a fallback for when upstream restores
+        // signed manifests.
+        if let Ok(details) = self.get_details(id).await {
+            let detector_releases = adapt::moviebox_detector_json_to_releases(
+                &details,
+                season,
+                episode,
+                self.user_agent(),
+            );
+            if !detector_releases.is_empty() {
+                return Ok(detector_releases);
+            }
+        }
+
         let (play_info_res, resources_res) = tokio::join!(
             self.get_play_info(id, season, episode),
             self.get_resources(
@@ -118,7 +135,10 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
 
         if releases.is_empty() {
             return Err(ProviderError::Unavailable(
-                "No stream sources available".to_string(),
+                "MovieBox no longer exposes a direct link for this title upstream \
+                 (its play-info endpoint answers with the site trailer). Series \
+                 episodes are the usual case. Try the 4KHDHub or Dramachi provider."
+                    .to_string(),
             ));
         }
 

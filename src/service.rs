@@ -187,6 +187,46 @@ impl MovieBoxService {
             .map_err(|e| e.to_string())
     }
 
+    /// Re-resolves a MovieBox release to a fresh signed URL.
+    ///
+    /// The detector links carry a `?sign=<token>&t=<expiry>` query, so a link
+    /// that was listed a while ago can already be stale. Refreshing right
+    /// before playback guarantees a working URL. Returns `None` when the
+    /// release cannot be refreshed, so callers keep the listed link.
+    pub async fn refresh_moviebox_source(
+        &self,
+        subject_id: &str,
+        resource_id: &str,
+    ) -> Option<crate::providers::models::PlaybackSource> {
+        if subject_id.trim().is_empty() || resource_id.trim().is_empty() {
+            return None;
+        }
+        let details = self.client.get_details(subject_id).await.ok()?;
+        let releases = crate::providers::moviebox::adapt::moviebox_detector_json_to_releases(
+            &details,
+            0,
+            0,
+            self.client.user_agent(),
+        );
+        let release = releases
+            .iter()
+            .find(|release| release.resource_id.as_deref() == Some(resource_id))?;
+        let mirror = release.mirrors.first()?;
+        Some(crate::providers::models::PlaybackSource {
+            provider: crate::providers::models::ProviderKind::MovieBox,
+            url: mirror.resolver_url.clone(),
+            // The CDN answers 429 when a `Referer` is sent and expects the
+            // MovieBox app user agent.
+            headers: vec![(
+                "User-Agent".to_string(),
+                self.client.user_agent().to_string(),
+            )],
+            subtitle: None,
+            source_label: mirror.label.clone(),
+            max_height: Some(release.resolution_u64()).filter(|&h| h > 0),
+        })
+    }
+
     pub async fn get_ext_captions(
         &self,
         subject_id: &str,

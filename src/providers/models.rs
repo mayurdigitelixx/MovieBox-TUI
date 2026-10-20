@@ -224,7 +224,11 @@ pub enum ResolutionIntent {
 pub struct SourceMirror {
     pub label: String,
     pub resolver_url: String,
+    /// Optional on the way in: the Android bridge receives a release that was
+    /// re-encoded by the app, and the app does not carry mirror headers.
+    #[serde(default)]
     pub headers: Vec<(String, String)>,
+    #[serde(default)]
     pub direct_file: bool,
 }
 
@@ -234,16 +238,28 @@ pub struct SubtitleOption {
     pub url: String,
 }
 
+/// A playable release.
+///
+/// Every optional field tolerates a missing key, because the release travels
+/// to the Android app and back: the app re-encodes it with its own model,
+/// which omits fields that are unset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Release {
     pub provider: ProviderKind,
     pub filename: String,
+    #[serde(default)]
     pub quality: Option<String>,
+    #[serde(default)]
     pub codec: Option<String>,
+    #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
     pub size_bytes: Option<u64>,
+    #[serde(default)]
     pub season: Option<usize>,
+    #[serde(default)]
     pub episode: Option<usize>,
+    #[serde(default)]
     pub mirrors: Vec<SourceMirror>,
     #[serde(default)]
     pub resource_id: Option<String>,

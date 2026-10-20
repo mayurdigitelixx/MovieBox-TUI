@@ -4,6 +4,20 @@ Tracked here so future work and issue reports reference the same facts.
 
 ## Latent / by-design
 
+- **MovieBox stopped exposing direct links for series episodes upstream.** The subject
+  details payload carries an empty `resourceDetectors[].resolutionList` for series and
+  points at an index site instead (`fzmovies.cms etc.`, `kickasstorrents.to etc.`), so
+  no CDN link exists to play. Movies are unaffected: their detector still carries the
+  signed `*.hakunaymatata.com` links. MovieBox reports this as "no direct source for
+  this title"; use 4KHDHub or Dramachi for series.
+- **MovieBox `play-info` returns the site trailer instead of the stream.** The endpoint
+  answers with a ~23 second placeholder MP4 (identical for every title) and an empty
+  `signCookie`. The client therefore resolves streams from the subject details
+  `resourceDetectors` block instead; the `play-info` path is kept as a fallback.
+  See [providers.md](providers.md#moviebox-stream-resolution-detector-links).
+- **MovieBox stream links are signed and time limited.** The `?sign=<token>&t=<expiry>`
+  query is refreshed right before playback, so a link that was listed a while ago is
+  replaced by a fresh one.
 - **`supports_headers` routes authenticated streams via loopback proxy.** Sources that
   carry authentication headers (e.g. MovieBox CloudFront signed cookies) automatically
   route through the local detached HTTP loopback proxy (`src/proxy.rs`) for both VLC and

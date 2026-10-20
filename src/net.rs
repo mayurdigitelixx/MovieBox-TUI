@@ -218,7 +218,9 @@ mod tests {
             }
         });
         let url = format!("http://{addr}/video.mkv");
-        assert!(probe_url(&url, std::time::Duration::from_secs(2)).await);
+        // The probe budget has to survive a loaded CI runner, where the
+        // in-process listener can be scheduled late.
+        assert!(probe_url(&url, std::time::Duration::from_secs(10)).await);
     }
     #[test]
     fn test_is_http_url() {

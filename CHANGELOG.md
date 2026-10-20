@@ -3,7 +3,11 @@
 ## [Unreleased]
 
 ### Fixed
+- **Hermetic Player Detection Tests**: Isolated Termux opener and playback selection tests from the host `PATH`, graphical-session variables, and `MOVIEBOX_PLAYER` setting.
 - **Media Playback & Subtitle Engine**:
+  - Restored MovieBox playback by resolving streams from the subject details `resourceDetectors` block. The upstream `play-info` endpoint answers with the site trailer instead of the media since 2026-10, which made every title fail with "No stream sources available"; the signed `*.hakunaymatata.com` links are now used instead and the `play-info` path is kept as a fallback.
+  - Refreshed MovieBox stream links right before playback, because the `?sign=<token>&t=<expiry>` query is time limited and a listed link can expire before the player starts.
+  - Renamed the placeholder-clip check to `is_trailer_or_notice_url` and reported MovieBox titles without an upstream direct link with an actionable message instead of a generic one.
   - Reset legacy Android player defaults in graphical X11 and Wayland sessions so native Linux players take precedence over external Android intent dialogs.
   - Prioritized native Linux media player paths over foreign container fallbacks on Linux systems and preserved dynamic auto-player resolution for unconfigured sessions.
 - **Providers & Stream Resolution**:

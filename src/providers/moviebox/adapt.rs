@@ -443,6 +443,230 @@ pub fn moviebox_details_json_to_media_details(
     })
 }
 
+pub fn is_deprecation_notice_url(url: &str) -> bool {
+    is_trailer_or_notice_url(url)
+}
+
+/// Detects the placeholder clip that upstream now returns in place of a
+/// stream.
+///
+/// As of 2026-10 the `play-info` endpoint answers with the site trailer
+/// (a ~23 second MP4) instead of the actual media, and the `resource`
+/// endpoint points `resourceLink` at the very same file. Those URLs must
+/// never be offered as playable mirrors.
+///
+/// The trailer lives on `macdn.aoneroom.com` under `/other/<date>/<hash>.mp4`
+/// and is byte-identical for every title, so the host+path heuristic is
+/// enough to recognise it. Real media is served from the `*.hakunaymatata.com`
+/// CDN with a `?sign=<token>&t=<expiry>` query.
+pub fn is_trailer_or_notice_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("1c7de0bd3393702d9191801f15f88f8d")
+        || lower.contains("9a0461bc39da389663bf3dbb17091d3f")
+        || lower.contains("b164fbfb4347792950bdfbfb563d39d9")
+        || lower.contains("/notice.mp4")
+        || (lower.contains("macdn.aoneroom.com") && lower.contains("/other/"))
+}
+
+/// Parses the `resourceDetectors` block of a subject-details payload into
+/// releases.
+///
+/// The details endpoint keeps exposing the real media even while `play-info`
+/// only returns the trailer. Every detector holds a `resolutionList` whose
+/// entries carry a signed CDN link (`?sign=<token>&t=<expiry>`), the real
+/// file size, duration and codec, so a release built from it is playable
+/// where a `play-info` release is not.
+///
+/// The CDN expects the MovieBox app user agent and rejects a `Referer`
+/// header, so every mirror carries the user agent only.
+pub fn moviebox_detector_json_to_releases(
+    payload: &serde_json::Value,
+    season: usize,
+    episode: usize,
+    user_agent: &str,
+) -> Vec<Release> {
+    let data = payload.get("data").unwrap_or(payload);
+    let Some(detectors) = data.get("resourceDetectors").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut releases = Vec::new();
+
+    for detector in detectors {
+        let detector_codec = detector
+            .get("codecName")
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.trim().is_empty())
+            .map(|s| s.to_string());
+        let detector_source = detector
+            .get("source")
+            .and_then(|s| s.as_str())
+            .unwrap_or("MovieBox")
+            .to_string();
+        let detector_uploader = detector
+            .get("uploadBy")
+            .and_then(|u| u.as_str())
+            .unwrap_or("Direct")
+            .to_string();
+
+        let Some(entries) = detector.get("resolutionList").and_then(|r| r.as_array()) else {
+            continue;
+        };
+
+        for entry in entries {
+            let entry_se = entry
+                .get("se")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .or_else(|| {
+                    entry
+                        .get("se")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                });
+            let entry_ep = entry
+                .get("ep")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .or_else(|| {
+                    entry
+                        .get("ep")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                });
+
+            // A request for a specific episode must not pick up the links of
+            // another one. Movie subjects report `se = 0` / `ep = 0`.
+            if season != 0 || episode != 0 {
+                let matches = entry_se.map(|s| s == season).unwrap_or(true)
+                    && entry_ep.map(|e| e == episode).unwrap_or(true);
+                if !matches {
+                    continue;
+                }
+            }
+
+            let Some(link) = entry
+                .get("resourceLink")
+                .or_else(|| entry.get("url"))
+                .and_then(|l| l.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .filter(|s| !is_trailer_or_notice_url(s))
+            else {
+                continue;
+            };
+
+            let resolution = entry.get("resolution").and_then(|r| {
+                if let Some(n) = r.as_u64() {
+                    Some(format!("{n}p"))
+                } else if let Some(n) = r.as_i64() {
+                    Some(format!("{n}p"))
+                } else {
+                    r.as_str()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                }
+            });
+
+            let codec = entry
+                .get("codecName")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.trim().is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| detector_codec.clone());
+
+            let size_bytes = entry.get("size").and_then(|s| {
+                if let Some(n) = s.as_u64() {
+                    Some(n)
+                } else if let Some(n) = s.as_i64() {
+                    Some(n as u64)
+                } else if let Some(str_val) = s.as_str() {
+                    str_val.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            });
+
+            let title = entry
+                .get("title")
+                .and_then(|t| t.as_str())
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty());
+            let filename = match title {
+                Some(t) => t.to_string(),
+                None => {
+                    let uploader = entry
+                        .get("uploadBy")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or(&detector_uploader);
+                    match &resolution {
+                        Some(res) => format!("{uploader} {res}"),
+                        None => uploader.to_string(),
+                    }
+                }
+            };
+
+            let language = entry
+                .get("language")
+                .or_else(|| entry.get("lanName"))
+                .and_then(|l| l.as_str())
+                .map(|s| s.to_string());
+
+            let resource_id = entry
+                .get("resourceId")
+                .or_else(|| entry.get("id"))
+                .and_then(|v| {
+                    if let Some(num) = v.as_i64() {
+                        Some(num.to_string())
+                    } else if let Some(num) = v.as_u64() {
+                        Some(num.to_string())
+                    } else {
+                        v.as_str().map(|s| s.to_string())
+                    }
+                });
+
+            let label = entry
+                .get("uploadBy")
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or(&detector_uploader)
+                .to_string();
+            let label = if label.trim().is_empty() {
+                detector_source.clone()
+            } else {
+                label
+            };
+
+            releases.push(Release {
+                provider: ProviderKind::MovieBox,
+                filename,
+                quality: resolution,
+                codec,
+                language,
+                size_bytes,
+                season: entry_se,
+                episode: entry_ep,
+                mirrors: vec![SourceMirror {
+                    label,
+                    resolver_url: link.to_string(),
+                    headers: vec![("User-Agent".to_string(), user_agent.to_string())],
+                    direct_file: true,
+                }],
+                resource_id,
+            });
+        }
+    }
+
+    releases.sort_by(|left, right| {
+        right
+            .resolution_u64()
+            .cmp(&left.resolution_u64())
+            .then_with(|| right.size_bytes.cmp(&left.size_bytes))
+    });
+
+    releases
+}
+
 pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
     if let Some(r) = item
         .get("_addon_release")
@@ -559,15 +783,6 @@ pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
         mirrors,
         resource_id,
     }
-}
-
-pub fn is_deprecation_notice_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains("1c7de0bd3393702d9191801f15f88f8d")
-        || lower.contains("9a0461bc39da389663bf3dbb17091d3f")
-        || lower.contains("b164fbfb4347792950bdfbfb563d39d9")
-        || lower.contains("/notice.mp4")
-        || (lower.contains("macdn.aoneroom.com") && lower.contains("/other/"))
 }
 
 fn to_dash_mpd(url_str: &str) -> Option<String> {
@@ -1166,6 +1381,222 @@ mod tests {
         assert!(
             releases.is_empty(),
             "Deprecation notice MP4 must be rejected"
+        );
+    }
+
+    /// Payload captured from the live subject-details endpoint on 2026-10-19,
+    /// trimmed to the fields the parser reads.
+    fn detector_payload() -> serde_json::Value {
+        json!({
+            "code": 0,
+            "data": {
+                "subjectId": "1511967966181605720",
+                "title": "Dune [Hindi]",
+                "resourceDetectors": [
+                    {
+                        "codecName": "hevc",
+                        "downloadUrl": "https://bcdn.hakunaymatata.com/resource/h265/b4fec5835e6e60b1d14e1378b1c3f013.mp4?sign=e41fa223eba40b077ad70899221b0381&t=1792429748",
+                        "extCaptions": [],
+                        "firstSize": "537628837",
+                        "postId": "6727829091426730920",
+                        "resourceId": "4625404299126915080",
+                        "resourceLink": "https://vegamovies.pet/c33e94a39f150abc655679cd891c1491/Dune-480P-h265",
+                        "source": "vegamovies.pet",
+                        "subjectId": "1511967966181605720",
+                        "totalEpisode": 1,
+                        "totalSize": "2361181950",
+                        "type": 0,
+                        "uploadBy": "adilessa",
+                        "uploadTime": "1723618507",
+                        "resolutionList": [
+                            {
+                                "codecName": "hevc",
+                                "duration": 9325,
+                                "ep": 0,
+                                "episode": 0,
+                                "extCaptions": [],
+                                "linkType": 2,
+                                "postId": "6727829091426730920",
+                                "requireMemberType": 0,
+                                "resolution": 480,
+                                "resourceId": "4625404299126915080",
+                                "resourceLink": "https://bcdn.hakunaymatata.com/resource/h265/b4fec5835e6e60b1d14e1378b1c3f013.mp4?sign=e41fa223eba40b077ad70899221b0381&t=1792429748",
+                                "se": 0,
+                                "size": "537628837",
+                                "sourceUrl": "https://vegamovies.pet/c33e94a39f150abc655679cd891c1491/Dune-480P-h265",
+                                "title": "Dune",
+                                "uploadBy": "adilessa"
+                            },
+                            {
+                                "codecName": "h264",
+                                "duration": 9324,
+                                "ep": 0,
+                                "episode": 0,
+                                "extCaptions": [],
+                                "linkType": 2,
+                                "postId": "4858807051218236672",
+                                "requireMemberType": 0,
+                                "resolution": 1080,
+                                "resourceId": "5764199508657799296",
+                                "resourceLink": "https://bcdn.hakunaymatata.com/tran-audio/20250626/e9a9f9ff00c119587b658c6af20e406e.mp4?sign=928efb4952ee839d536ce79a16997aa2&t=1792432803",
+                                "se": 0,
+                                "size": "1823553113",
+                                "sourceUrl": "https://vegamovies.pet/edf379f034d86420619072e30309f560/Dune-1080P-tran-audio-channel",
+                                "title": "Dune [Hindi]-1080P",
+                                "uploadBy": "adilessa"
+                            }
+                        ]
+                    }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn test_detector_json_to_releases_parses_signed_cdn_links() {
+        let releases =
+            moviebox_detector_json_to_releases(&detector_payload(), 0, 0, "TestAgent/1.0");
+
+        assert_eq!(releases.len(), 2);
+        // Highest resolution first.
+        assert_eq!(releases[0].quality.as_deref(), Some("1080p"));
+        assert_eq!(releases[1].quality.as_deref(), Some("480p"));
+
+        assert_eq!(releases[0].codec.as_deref(), Some("h264"));
+        assert_eq!(releases[0].size_bytes, Some(1_823_553_113));
+        assert_eq!(releases[1].size_bytes, Some(537_628_837));
+        assert_eq!(releases[0].filename, "Dune [Hindi]-1080P");
+        assert_eq!(
+            releases[0].resource_id.as_deref(),
+            Some("5764199508657799296")
+        );
+
+        let mirror = &releases[0].mirrors[0];
+        assert!(mirror.direct_file);
+        assert_eq!(mirror.label, "adilessa");
+        assert!(
+            mirror
+                .resolver_url
+                .starts_with("https://bcdn.hakunaymatata.com/"),
+            "unexpected mirror: {}",
+            mirror.resolver_url
+        );
+        assert!(mirror.resolver_url.contains("sign="));
+        assert_eq!(
+            mirror.headers,
+            vec![("User-Agent".to_string(), "TestAgent/1.0".to_string())],
+            "the CDN expects the app user agent and rejects a Referer"
+        );
+    }
+
+    #[test]
+    fn test_detector_json_to_releases_skips_the_placeholder_trailer() {
+        let mut payload = detector_payload();
+        payload["data"]["resourceDetectors"][0]["resolutionList"] = json!([
+            {
+                "codecName": "hevc",
+                "duration": 23,
+                "ep": 0,
+                "resolution": 480,
+                "size": "824720",
+                "resourceId": "4625404299126915080",
+                "resourceLink": "https://macdn.aoneroom.com/other/2026/10/10/80da52722ee7de7a4303290af6783424.mp4",
+                "se": 0,
+                "title": "Dune",
+                "uploadBy": "adilessa"
+            }
+        ]);
+
+        let releases = moviebox_detector_json_to_releases(&payload, 0, 0, "TestAgent/1.0");
+        assert!(
+            releases.is_empty(),
+            "the site trailer must never become a playable release"
+        );
+    }
+
+    #[test]
+    fn test_detector_json_to_releases_filters_the_requested_episode() {
+        let mut payload = detector_payload();
+        payload["data"]["resourceDetectors"][0]["resolutionList"] = json!([
+            {
+                "codecName": "h264",
+                "duration": 3000,
+                "ep": 1,
+                "resolution": 1080,
+                "size": "900000000",
+                "resourceId": "111",
+                "resourceLink": "https://bcdn.hakunaymatata.com/ep1.mp4?sign=a&t=1",
+                "se": 1,
+                "title": "Episode 1",
+                "uploadBy": "uploader"
+            },
+            {
+                "codecName": "h264",
+                "duration": 3000,
+                "ep": 2,
+                "resolution": 1080,
+                "size": "800000000",
+                "resourceId": "222",
+                "resourceLink": "https://bcdn.hakunaymatata.com/ep2.mp4?sign=b&t=1",
+                "se": 1,
+                "title": "Episode 2",
+                "uploadBy": "uploader"
+            }
+        ]);
+
+        let releases = moviebox_detector_json_to_releases(&payload, 1, 2, "TestAgent/1.0");
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].filename, "Episode 2");
+        assert_eq!(releases[0].episode, Some(2));
+        assert_eq!(releases[0].season, Some(1));
+    }
+
+    #[test]
+    fn test_detector_json_to_releases_ignores_detectors_without_links() {
+        let payload = json!({
+            "code": 0,
+            "data": {
+                "resourceDetectors": [
+                    {
+                        "codecName": "",
+                        "downloadUrl": "",
+                        "postId": "3639848841740012888",
+                        "resolutionList": [],
+                        "resourceId": "5369231098650281824",
+                        "resourceLink": "https://kickasstorrents.to//059108/season-1/episode-1/Dune-360P",
+                        "source": "kickasstorrents.to etc.",
+                        "totalEpisode": 3
+                    }
+                ]
+            }
+        });
+
+        let releases = moviebox_detector_json_to_releases(&payload, 1, 1, "TestAgent/1.0");
+        assert!(
+            releases.is_empty(),
+            "an unresolved detector must not produce a release"
+        );
+    }
+
+    #[test]
+    fn test_is_trailer_or_notice_url_recognises_the_placeholder_clip() {
+        assert!(is_trailer_or_notice_url(
+            "https://macdn.aoneroom.com/other/2026/10/10/80da52722ee7de7a4303290af6783424.mp4"
+        ));
+        assert!(is_trailer_or_notice_url(
+            "https://macdn.aoneroom.com/other/2026/09/01/9a0461bc39da389663bf3dbb17091d3f.mp4"
+        ));
+        assert!(!is_trailer_or_notice_url(
+            "https://bcdn.hakunaymatata.com/resource/h265/b4fec5835e6e60b1d14e1378b1c3f013.mp4?sign=e41fa223&t=1792429748"
+        ));
+        // The legacy name keeps working for callers that still use it.
+        assert_eq!(
+            is_deprecation_notice_url(
+                "https://macdn.aoneroom.com/other/2026/10/10/80da52722ee7de7a4303290af6783424.mp4"
+            ),
+            is_trailer_or_notice_url(
+                "https://macdn.aoneroom.com/other/2026/10/10/80da52722ee7de7a4303290af6783424.mp4"
+            )
         );
     }
     #[test]
